@@ -12,6 +12,9 @@ Hi! Here we will be uploading all the files, exercises and projects of the "Dist
 # Files
 
 **Partial 01**
-* assigment1-1 (q1 and q2)
-* assigment1-2 (Map/Reduce)
-* assigment1-3 (Assignment 1)
+* assignment1-1 (q1 and q2)
+* assignment1-2 (Map/Reduce)
+* assignment1-3 (Inverted Index)
+
+**Partial 02**
+* assignment2 (Chandy-Lamport)
