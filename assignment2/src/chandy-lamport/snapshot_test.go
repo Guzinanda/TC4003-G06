@@ -39,6 +39,7 @@ func runTest(t *testing.T, topFile string, eventsFile string, snapFiles []string
 	for i := 0; i < len(actualSnaps); i++ {
 		assertEqual(expectedSnaps[i], actualSnaps[i])
 	}
+	fmt.Println("")
 }
 
 func Test2NodesSimple(t *testing.T) {

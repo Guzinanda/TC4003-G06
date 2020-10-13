@@ -1,8 +1,8 @@
 package chandy_lamport
 
 import (
+	"fmt"
 	"log"
-	"strconv"
 )
 
 // The main participant of the distributed snapshot protocol.
@@ -16,8 +16,12 @@ type Server struct {
 	sim           *Simulator
 	outboundLinks map[string]*Link // key = link.dest
 	inboundLinks  map[string]*Link // key = link.src
-	snapshots     map[int]*SnapshotState
-	storeMessages map[string]bool
+	snapshots 	  *SyncMap // A safe Mapping mechanism that contains a mapping from servers Ids and a SnapshotState
+}
+
+type Snapshot struct {
+	state SnapshotState
+	receivedMarkers map[string]bool
 }
 
 // A unidirectional communication channel between two servers
@@ -35,8 +39,7 @@ func NewServer(id string, tokens int, sim *Simulator) *Server {
 		sim,
 		make(map[string]*Link),
 		make(map[string]*Link),
-		make(map[int]*SnapshotState),
-		make(map[string]bool),
+		NewSyncMap(),
 	}
 }
 
@@ -90,49 +93,56 @@ func (server *Server) SendTokens(numTokens int, dest string) {
 // When the snapshot algorithm completes on this server, this function
 // should notify the simulator by calling `sim.NotifySnapshotComplete`.
 func (server *Server) HandlePacket(src string, message interface{}) {
+	snapShotMessage := SnapshotMessage{src, server.Id, message}
 
-	// Here the type of message is checked.
+	// Identifying the message type and taking action accordingly.
 	switch message := message.(type) {
-	
-	// Case for tokens representing the process state.
-	case TokenMessage:
-		// Get the number of tokens in the process.
-		numTokens := message.numTokens
+		// Case for tokens representing the process state.
+		case TokenMessage:
+			fmt.Println(server.Id, ": Receives TokenMessage from", src)
 
-		// The server receives the number of tokens.
-		server.Tokens += numTokens
+			// Get the number of tokens in the process.
+			numTokens := message.numTokens
 
-		// The server remembers whether it has been snapshotted.
-		for _, snapshot := range server.snapshots {
-			// Store the messages to every open snapshot, those that are not in storeMessages map.
-			storeMessagesKey := strconv.Itoa(snapshot.id) + "," + src
-			if _, ok := server.storeMessages[storeMessagesKey]; !ok {
-				snapshotMsg := SnapshotMessage{src, server.Id, message}
-				snapshot.messages = append(snapshot.messages, &snapshotMsg)
+			// The server receives the number of tokens.
+			server.Tokens += numTokens
+
+			// The server remembers whether it has been snapshotted.
+			server.snapshots.Range(func (key, value interface{}) bool {
+				snapshot := value.(*Snapshot)
+				if _, ok := snapshot.receivedMarkers[src]; !ok {
+					snapshot.state.messages = append(snapshot.state.messages, &snapShotMessage)
+				}
+				return true
+			})
+
+		// Case for marker messages.
+		case MarkerMessage:
+			fmt.Println(server.Id, ": Receives MarkerMessage from", src)
+
+			// Get the snapshotId received in the message.
+			snapshotID := message.snapshotId
+			value, snapshotOccurred := server.snapshots.Load(snapshotID)
+			// Check whether there is a snapshot of the received snapshotID in the server.
+			if !snapshotOccurred {
+				// If there is no a snapshot, take the snapshot.
+				server.StartSnapshot(snapshotID)
+				value, _ = server.snapshots.Load(snapshotID)
 			}
-		}
-	
-	// Case for marker messages.
-	case MarkerMessage:
-		// Get the snapshotId received in the message.
-		snapshotID := message.snapshotId
+			snapshot := value.(*Snapshot)
 
-		// Check whether there is a snapshot of the received snapshotID in the server.
-		_, snapshotOccurred := server.snapshots[snapshotID]
-		if !snapshotOccurred {
-			// Take the snapshot.
-			server.StartSnapshot(snapshotID)
-		}
-
-		// Stop storing messages for the snapshot, only for such channel.
-		storeMessagesKey := strconv.Itoa(snapshotID) + "," + src
-		server.storeMessages[storeMessagesKey] = false
+			snapshot.receivedMarkers[src] = true
+			if len(snapshot.receivedMarkers) == len(server.inboundLinks) {
+				server.sim.NotifySnapshotComplete(server.Id, message.snapshotId)
+			}
 	}
 }
 
 // Start the chandy-lamport snapshot algorithm on this server.
 // This should be called only once per server.
 func (server *Server) StartSnapshot(snapshotId int) {
+	fmt.Println(server.Id,": StartSnapshot snapshotId", snapshotId)
+
 	// Create tokens map, mapping keys to expected token Ids.
 	serverTokens := make(map[string]int)
 	serverTokens[server.Id] = server.Tokens
@@ -141,11 +151,10 @@ func (server *Server) StartSnapshot(snapshotId int) {
 	serverMessages := make([]*SnapshotMessage, 0)
 
 	// Stores own snapshot in the snapshots map of the server.
-	server.snapshots[snapshotId] = &SnapshotState{snapshotId, serverTokens, serverMessages}
+	snapshotState := SnapshotState{snapshotId, serverTokens, serverMessages}
+	snapshot := Snapshot{snapshotState, make(map[string]bool)}
+	server.snapshots.Store(snapshotId, &snapshot)
 
 	// Send a marker message to all server outbound links, to take their snapshots.
 	server.SendToNeighbors(MarkerMessage{snapshotId})
-
-	// Notify the simulator that snapshot is complete.
-	server.sim.NotifySnapshotComplete(server.Id, snapshotId)
 }

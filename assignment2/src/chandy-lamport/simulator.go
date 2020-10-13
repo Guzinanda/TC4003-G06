@@ -3,6 +3,7 @@ package chandy_lamport
 import (
 	"log"
 	"math/rand"
+	"fmt"
 )
 
 // Max random delay added to packet delivery
@@ -23,7 +24,7 @@ type Simulator struct {
 	nextSnapshotId    int
 	servers           map[string]*Server // key = server ID
 	logger            *Logger
-	allChannels       map[int]chan string
+	snapshots		  *SyncMap // A safe Mapping mechanism that contains a mapping from servers Ids and a SnapshotState
 }
 
 func NewSimulator() *Simulator {
@@ -32,7 +33,7 @@ func NewSimulator() *Simulator {
 		0,
 		make(map[string]*Server),
 		NewLogger(),
-		make(map[int]chan string),
+		NewSyncMap(),
 	}
 }
 
@@ -109,9 +110,11 @@ func (sim *Simulator) StartSnapshot(serverId string) {
 	sim.nextSnapshotId++
 	sim.logger.RecordEvent(sim.servers[serverId], StartSnapshot{serverId, snapshotId})
 	
+	sim.snapshots.Store(snapshotId, make(chan string))
+
 	// Get the initial server object and take its snapshot.
-	Server := sim.servers[serverId]
-	Server.StartSnapshot(snapshotId)
+	server := sim.servers[serverId]
+	server.StartSnapshot(snapshotId)
 }
 
 // Callback for servers to notify the simulator that the snapshot process has
@@ -119,14 +122,19 @@ func (sim *Simulator) StartSnapshot(serverId string) {
 func (sim *Simulator) NotifySnapshotComplete(serverId string, snapshotId int) {
 	sim.logger.RecordEvent(sim.servers[serverId], EndSnapshot{serverId, snapshotId})
 	
+	fmt.Println(serverId, ": NotifySnapshotComplete, snapshotId", snapshotId)
+
 	// Create a channel for this snapshot in case there is any.
-	_, ok := sim.allChannels[snapshotId]
+	value, ok := sim.snapshots.Load(snapshotId)
 	if !ok {
-		sim.allChannels[snapshotId] = make(chan string, 50)
+		// This line should never be reached, if reached, it means that StartSnapshot
+		// was not triggered before NotifySnapshotComplete
+		panic(snapshotId)
 	}
 
 	// Stop blocking the snapshot process by sending the serverId in the channel.
-	sim.allChannels[snapshotId] <- serverId
+	channel := value.(chan string)
+	channel <- serverId
 }
 
 // Collect and merge snapshot state from all the servers.
@@ -135,33 +143,28 @@ func (sim *Simulator) CollectSnapshot(snapshotId int) *SnapshotState {
 	// Create the map of the snapshot state.
 	snapState := SnapshotState{snapshotId, make(map[string]int), make([]*SnapshotMessage, 0)}
 	
-	// Create a map of the pending servers to complete their snapshots. At the beginning, all servers are pending.
-	uncompletedServers := make(map[string]bool)
-	for key := range sim.servers {
-		uncompletedServers[key] = true
-	}
+	value, _ := sim.snapshots.Load(snapshotId)
+	channel := value.(chan string)
 
-	// The snapshot process will be blocked until there are no servers pending to complete their snapshots.
-	// The simulator removes the Id from pending servers map when channel associated receives the serverId to stop blocking the snapshot process.
-	for len(uncompletedServers) > 0 {
-		completedServerID := <-sim.allChannels[snapshotId]
-		delete(uncompletedServers, completedServerID)
-	}
-
-	// Get the individual snapshots of each server.
-	for _, server := range sim.servers {
-		// Store corresponding server snapshot.
-		serverSnapshot := server.snapshots[snapshotId]
-
-		// Copy the tokens from the snapshot into the global snapshot.
-		for key, value := range serverSnapshot.tokens {
-			snapState.tokens[key] = value
+	// We only need to verify that for each server, we are obtaining the complete snapshots.
+	// Since we do not know the order in how the servers finish their snapshots, we obtain
+	// thos valus from the channel. We could have waited for all the snapshots to be completed
+	// form the beginning before calculating the snapState, but it is the same to process it
+	// by demand.
+	for range sim.servers {
+		server := <-channel
+		value, ok := sim.servers[server].snapshots.Load(snapshotId)
+		if !ok {
+			panic(server)
 		}
+		serverSnapshot := value.(*Snapshot)
 
-		// Append to the snapshot all subsequent messages.
-		for _, value := range serverSnapshot.messages {
-			snapState.messages = append(snapState.messages, value)
-		}
+		// This snapshot is completed and obtained all the states from the current server
+		// we can delete it to avoid recounting.
+		sim.servers[server].snapshots.Delete(snapshotId)
+
+		snapState.messages = append(snapState.messages, serverSnapshot.state.messages...)
+		snapState.tokens[server] = serverSnapshot.state.tokens[server]
 	}
 	
 	return &snapState
