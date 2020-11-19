@@ -149,8 +149,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here.
-	VoteGranted bool
 	candidateCurrentTerm int
+	VoteGranted bool
 }
 
 //
@@ -164,12 +164,14 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = false
 	} else {
 		//	If the term of a candidate server or leader server is outdated, it becomes Follower.
-		rf.currentTerm = args.candidateTerm
 		rf.serverState = "Follower"
-		// Reset the election timeout with an arbitrary length of time: random time between 50 and 60.
-		rf.electionTimeout = 50 + rand.Intn(10) // Starts Election timer
+		rf.currentTerm = args.candidateTerm
+		// Reset the election timeout with an arbitrary length of time: random time between 150 and 300.
+		rf.electionTimeout = 150 + rand.Intn(150) // Starts Election timer
 		reply.VoteGranted = true
 	}
+	
+	// Update the term of the candidate with current term.
 	reply.candidateCurrentTerm = rf.currentTerm
 }
 
@@ -214,21 +216,24 @@ type AppendEntriesArgs struct {
 // AppendEntries RPC reply structure.
 //
 type AppendEntriesReply struct {
-	Success bool
 	currentLeaderTerm int
+	Success bool
 }
 
 //
 // AppendEntries RPC handler.
 //
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
+	// Leader use AppendEntries RPC for log replication. Also, AppendEntries RPC is used to send hearbeats.
 	if rf.currentTerm <= args.CurrentTerm {
-		// If the term of a Candidate server is outdated, it becomes Follower.
-		rf.currentTerm = args.CurrentTerm
+		// If the term of a Leader server is outdated, it becomes Follower.
 		rf.serverState = "Follower"
-		// Reset the election timeout with an arbitrary length of time: random time between 50 and 60.
-		rf.electionTimeout = 50 + rand.Intn(10)
+		rf.currentTerm = args.CurrentTerm
+		// Reset the election timeout with an arbitrary length of time: random time between 150 and 300.
+		rf.electionTimeout = 150 + rand.Intn(150)
 	}
+	
+	// Update the term of the server with current term.
 	reply.currentLeaderTerm = rf.currentTerm
 }
 
@@ -294,11 +299,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here.
+	rf.serverState = "Follower"
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.commitIndex = 0
 	rf.lastApplied = 0
-	rf.serverState = "Follower"
 	rf.log = make([]*logEntries, 0)
 	rf.log = append(rf.log, &logEntries{0, 0, nil})
 
@@ -317,8 +322,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 // Election process will be held if the server is not leader and no heartbeat has been received.
 //
 func (rf *Raft) startElection() {
-	// Reset the election timeout with an arbitrary length of time: random time between 50 and 60.
-	rf.electionTimeout = 50 + rand.Intn(10)
+	// Reset the election timeout with an arbitrary length of time: random time between 150 and 300.
+	rf.electionTimeout = 150 + rand.Intn(150)
 	// Hold the millisecond accuracy for the timeouts.
 	oneMillisecond := 1 * time.Millisecond
 	
@@ -333,44 +338,47 @@ func (rf *Raft) startElection() {
 					rf.serverState = "Candidate"
 				}
 			case "Candidate":
-				// The server is a Candidate. Used to elect a new Leader.
+				// The server is a Candidate (Leader unavailable). Used to elect a new Leader.
 				// No more heartbeats were received, so the election timeout expired.
 				if rf.electionTimeout < 0 {
-					// Reset the election timeout with an arbitrary length of time: random time between 50 and 60.
-					rf.electionTimeout = 50 + rand.Intn(10)
+					// Reset the election timeout with an arbitrary length of time: random time between 150 and 300.
+					rf.electionTimeout = 150 + rand.Intn(150)
+					// Start the term (arbitrary period of time on the server for which a new leader needs to be elected).
 					rf.currentTerm++
 					// Candidate votes for itself
 					rf.votesCount = 1
 					// Iterate through all peers to send RPCs for requesting votes.
 					for index := range rf.peers {
 						if index != rf.me {
-							// sending requests of votes to the rest
-							// Creates goroutine to avoid blocking loop while waiting for reply
+							// Invoke RequestVote RPC to gather votes from all other servers.
+							// Creates goroutine to avoid blocking the loop while waiting for reply.
 							go rf.sendRequestVoteMsgs(index)
 						}
 					}
 				} else {
 					// Heartbeats still received.
 					if rf.votesCount > int(len(rf.peers)/2) {
-						// The server becomes Leader as received votes from majority of servers.
+						// The server becomes Leader as it received votes from majority of servers.
 						rf.serverState = "Leader"
 						// Reset timeout of Leader to send heartbeats immediately.
 						rf.leaderTimeout = 0
 					} else {
 						// Heartbeats being received within election timeout window.
+						// There was a split vote, then wait until election timeout window ends in order to start a new election.
 						time.Sleep(oneMillisecond)
 						rf.electionTimeout--
 					}
 				}
 			case "Leader":
-				// This server is the Leader. Handles all client interactions and log replication. At most 1 viable leader at a time.
+				// This server is the Leader. Handles all client interactions and log replication. At most 1 viable Leader at a time.
+				// The Leader should send hearbeats within a specific heartbeat timeout window.
 				if rf.leaderTimeout < 0 {
-					// The timeout for the leader should be less than the election timeout, in order to avoid an stale term.
-					rf.leaderTimeout = 30
+					// The timeout for the Leader to send heartbeat should be less than the election timeout, in order to avoid an stale term.
+					rf.leaderTimeout = 100
 					// Iterate through all peers to check for a Leader.
 					for index := range rf.peers {
 						if index != rf.me {
-							// If already a leader, send heartbeats. Also used by leader for log replication.
+							// If already a Leader, send heartbeats to the Followers. Also used by Leader for log replication.
 							// Call goroutine to continue the loop in parallel.
 							go rf.sendAppendEntriesMsgs(index)
 						}
@@ -387,11 +395,30 @@ func (rf *Raft) startElection() {
 }
 
 //
+// Used by Candidate to request votes to other peers.
+//
+func (rf *Raft) sendRequestVoteMsgs(index int) {
+	// Create objects of RequestVoteReply type to be used in RPCs.
+	replies := RequestVoteReply{-1, false}
+	// Send Request Vote RPC.
+	rf.sendRequestVote(index, RequestVoteArgs{rf.currentTerm, rf.me, rf.log[len(rf.log)-1].logIndex, rf.log[len(rf.log)-1].term}, &replies)
+	if replies.VoteGranted == true {
+		// Vote was granted, increment general counter of votes.
+		rf.votesCount++
+	} else {
+		// Vote was not granted: replies.VoteGranted = false.
+		rf.currentTerm = replies.candidateCurrentTerm
+		// Becomes Follower as vote was not granted.
+		rf.serverState = "Follower"
+	}
+}
+
+//
 // Used by Leader to replicate log entries. Also used to send hearbeats.
 //
 func (rf *Raft) sendAppendEntriesMsgs(index int) {
 	// Create objects of AppendEntriesReply type to be used in RPCs.
-	replies := AppendEntriesReply{false, -1}
+	replies := AppendEntriesReply{-1, false}
 	// Send Append Entries RPC.
 	rf.sendAppendEntries(index, AppendEntriesArgs{rf.currentTerm, rf.me, 0, 0, nil, 0}, &replies)
 	if replies.currentLeaderTerm > rf.currentTerm {
@@ -399,25 +426,7 @@ func (rf *Raft) sendAppendEntriesMsgs(index int) {
 		rf.currentTerm = replies.currentLeaderTerm
 		// The term was not up to date, becomes Follower.
 		rf.serverState = "Follower"
-		// Reset the election timeout with an arbitrary length of time: random time between 50 and 60.
-		rf.electionTimeout = 50 + rand.Intn(10)
-	}
-}
-
-//
-// Used by Candidate to request votes to other peers.
-//
-func (rf *Raft) sendRequestVoteMsgs(index int) {
-	// Create objects of RequestVoteReply type to be used in RPCs.
-	replies := RequestVoteReply{false, -1}
-	// Send Request Vote RPC.
-	rf.sendRequestVote(index, RequestVoteArgs{rf.currentTerm, rf.me, rf.log[len(rf.log)-1].logIndex, rf.log[len(rf.log)-1].term}, &replies)
-	if replies.VoteGranted == false {
-		rf.currentTerm = replies.candidateCurrentTerm
-		// Becomes Follower as vote was not granted.
-		rf.serverState = "Follower"
-	} else {
-		// Vote was granted: replies.VoteGranted == true.
-		rf.votesCount++
+		// Reset the election timeout with an arbitrary length of time: random time between 150 and 300.
+		rf.electionTimeout = 150 + rand.Intn(150)
 	}
 }
